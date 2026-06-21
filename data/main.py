@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score, roc_curve, classification_report
+from sklearn.calibration import CalibratedClassifierCV
 import requests
 import os
 import warnings
@@ -131,18 +132,25 @@ def build_unified_feature_matrix(df_raw, target_region, neighbor_list, target_la
         master_df = pd.concat([master_df, pd.DataFrame(new_neighbor_columns)], axis=1)
 
     # 6. Temporal Features
-    master_df['hour_of_day'] = master_df.index.hour
-    master_df['day_of_week'] = master_df.index.dayofweek
+    if new_neighbor_columns:
+        master_df = pd.concat([master_df, pd.DataFrame(new_neighbor_columns)], axis=1)
 
-    # 7. Safe Drop NA
+        # --- FIX 1: CYCLIC TIME ENCODING ---
+    hours = master_df.index.hour
+    master_df['hour_sin'] = np.sin(2 * np.pi * hours / 24)
+    master_df['hour_cos'] = np.cos(2 * np.pi * hours / 24)
+
+    days = master_df.index.dayofweek
+    master_df['day_sin'] = np.sin(2 * np.pi * days / 7)
+    master_df['day_cos'] = np.cos(2 * np.pi * days / 7)
+    # We no longer need the raw linear hour/day columns
+
     master_df.dropna(inplace=True)
     print(f"Matrix built successfully! Final shape: {master_df.shape}")
-
     return master_df
 
 
 def train_and_evaluate(data, test_days=30, target_region='Unknown'):
-    # FIXED FOR 15-MIN: 4 blocks/hr * 24 hrs = 96 blocks/day
     test_blocks = test_days * 96
 
     train_data = data.iloc[:-test_blocks]
@@ -154,18 +162,32 @@ def train_and_evaluate(data, test_days=30, target_region='Unknown'):
     X_train, y_train = train_data[features], train_data[target]
     X_test, y_test = test_data[features], test_data[target]
 
-    print(f"\nTraining RandomForestClassifier on {len(features)} features...")
-    model = RandomForestClassifier(n_estimators=150, class_weight='balanced', random_state=42, max_depth=12)
-    model.fit(X_train, y_train)
+    print(f"\nTraining Calibrated RandomForest on {len(features)} features...")
 
-    y_pred_proba = model.predict_proba(X_test)[:, 1]
+    # --- FIX 3: ADD min_samples_leaf TO PREVENT NOISE MEMORIZATION ---
+    base_model = RandomForestClassifier(
+        n_estimators=150,
+        class_weight='balanced',
+        random_state=42,
+        max_depth=12,
+        min_samples_leaf=5  # Forces generalizability
+    )
+
+    # --- FIX 2: PROBABILITY CALIBRATION ---
+    # Wrap the model to fix the probability distortions caused by class_weight
+    calibrated_model = CalibratedClassifierCV(base_model, method='isotonic', cv=3)
+    calibrated_model.fit(X_train, y_train)
+
+    # Use the calibrated model for predictions
+    y_pred_proba = calibrated_model.predict_proba(X_test)[:, 1]
     auc_score = roc_auc_score(y_test, y_pred_proba)
 
     print("\n=== Model Evaluation ===")
     print(f"Test Period: Last {test_days} days")
     print(f"ROC AUC Score: {auc_score:.3f}")
 
-    custom_threshold = 0.3
+    # Because probabilities are now true percentages, 0.3 is a highly reliable threshold
+    custom_threshold = 0.30
     y_pred_custom = (y_pred_proba >= custom_threshold).astype(int)
 
     print(f"\nClassification Report (Custom Threshold: {int(custom_threshold * 100)}% Risk Tolerance):")
@@ -184,7 +206,7 @@ def train_and_evaluate(data, test_days=30, target_region='Unknown'):
     plt.show()
 
     # Feature Importance (Top 15)
-    importances = pd.Series(model.feature_importances_, index=features).sort_values(ascending=False)
+    importances = pd.Series(calibrated_model.feature_importances_, index=features).sort_values(ascending=False)
     plt.figure(figsize=(10, 5))
     importances.head(15).plot(kind='bar', color='steelblue')
     plt.title(f'Top 15 Decision Features for {target_region}')
