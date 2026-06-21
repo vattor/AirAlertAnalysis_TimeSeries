@@ -23,6 +23,8 @@ UKRAINE_ADJACENCY = {
     'Ivano-Frankivska oblast': ['Zakarpattia oblast', 'Lvivska oblast', 'Ternopilska oblast', 'Chernivetska oblast'],
     'Kyivska oblast': ['Zhytomyrska oblast', 'Chernihivska oblast', 'Poltavska oblast', 'Cherkaska oblast',
                        'Vinnytska oblast'],
+    'Kyiv City': ['Zhytomyrska oblast', 'Chernihivska oblast', 'Poltavska oblast', 'Cherkaska oblast',
+                       'Vinnytska oblast'],
     'Kirovohradska oblast': ['Cherkaska oblast', 'Poltavska oblast', 'Dnipropetrovska oblast', 'Mykolaivska oblast',
                              'Odeska oblast', 'Vinnytska oblast'],
     'Luhanska oblast': ['Kharkivska oblast', 'Donetska oblast'],
@@ -209,7 +211,7 @@ def train_and_evaluate(data, test_days=30, target_region='Unknown'):
 
 # --- Execution ---
 LOCAL_FILE = 'volunteer_data_en.csv'
-TARGET_REGION = 'Kyivska oblast'
+TARGET_REGION = 'Dnipropetrovska oblast'
 
 try:
     AUTOMATED_NEIGHBORS = UKRAINE_ADJACENCY[TARGET_REGION]
