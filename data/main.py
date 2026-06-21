@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score, roc_curve, classification_report
+from sklearn.calibration import CalibratedClassifierCV
 import requests
 import os
 import warnings
@@ -79,14 +80,7 @@ def download_raw_data(local_path='volunteer_data_en.csv'):
         print(f"Network error: {e}. Attempting to use local cache.")
 
 
-def build_unified_feature_matrix(df_raw, target_region, neighbor_list, target_lags=96, neighbor_lags=[2, 3, 4],
-                                 freq='15min'):
-    """
-    User-Optimized Unified Function:
-    1. Reverts to high-fidelity 15-minute tracking.
-    2. Uses specific neighbor lags (e.g., [2, 3, 4]) to capture the 15-60 min travel window.
-    3. Removes the "Current State" filter to retain the "All Clear" signal from neighbors.
-    """
+def build_unified_feature_matrix(df_raw, target_region, neighbor_list, target_lags=96, neighbor_lags=[2, 3, 4], freq='15min'):
     print(f"Building unified matrix for target: {target_region} at {freq} resolution...")
 
     # 1. Establish the absolute timeline bounds
@@ -127,22 +121,25 @@ def build_unified_feature_matrix(df_raw, target_region, neighbor_list, target_la
         for i in neighbor_lags:
             new_neighbor_columns[f'neighbor_{safe_name}_lag_{i}'] = n_timeline.shift(i)
 
+    # Concat ONLY ONCE
     if new_neighbor_columns:
         master_df = pd.concat([master_df, pd.DataFrame(new_neighbor_columns)], axis=1)
 
-    # 6. Temporal Features
-    master_df['hour_of_day'] = master_df.index.hour
-    master_df['day_of_week'] = master_df.index.dayofweek
+    # 6. Temporal Features (Cyclic Time Encoding)
+    hours = master_df.index.hour
+    master_df['hour_sin'] = np.sin(2 * np.pi * hours / 24)
+    master_df['hour_cos'] = np.cos(2 * np.pi * hours / 24)
 
-    # 7. Safe Drop NA
+    days = master_df.index.dayofweek
+    master_df['day_sin'] = np.sin(2 * np.pi * days / 7)
+    master_df['day_cos'] = np.cos(2 * np.pi * days / 7)
+
     master_df.dropna(inplace=True)
     print(f"Matrix built successfully! Final shape: {master_df.shape}")
-
     return master_df
 
 
 def train_and_evaluate(data, test_days=30, target_region='Unknown'):
-    # FIXED FOR 15-MIN: 4 blocks/hr * 24 hrs = 96 blocks/day
     test_blocks = test_days * 96
 
     train_data = data.iloc[:-test_blocks]
@@ -154,23 +151,35 @@ def train_and_evaluate(data, test_days=30, target_region='Unknown'):
     X_train, y_train = train_data[features], train_data[target]
     X_test, y_test = test_data[features], test_data[target]
 
-    print(f"\nTraining RandomForestClassifier on {len(features)} features...")
-    model = RandomForestClassifier(n_estimators=150, class_weight='balanced', random_state=42, max_depth=12)
-    model.fit(X_train, y_train)
+    print(f"\nTraining Calibrated RandomForest on {len(features)} features...")
 
-    y_pred_proba = model.predict_proba(X_test)[:, 1]
+    # Base Model
+    base_model = RandomForestClassifier(
+        n_estimators=150,
+        class_weight='balanced',
+        random_state=42,
+        max_depth=12,
+        min_samples_leaf=5  # Forces generalizability
+    )
+
+    # Calibrated Wrapper
+    calibrated_model = CalibratedClassifierCV(base_model, method='isotonic', cv=3)
+    calibrated_model.fit(X_train, y_train)
+
+    y_pred_proba = calibrated_model.predict_proba(X_test)[:, 1]
     auc_score = roc_auc_score(y_test, y_pred_proba)
 
     print("\n=== Model Evaluation ===")
     print(f"Test Period: Last {test_days} days")
     print(f"ROC AUC Score: {auc_score:.3f}")
 
-    custom_threshold = 0.3
+    custom_threshold = 0.30
     y_pred_custom = (y_pred_proba >= custom_threshold).astype(int)
 
     print(f"\nClassification Report (Custom Threshold: {int(custom_threshold * 100)}% Risk Tolerance):")
     print(classification_report(y_test, y_pred_custom))
 
+    # ROC Curve Plot
     fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
     plt.figure(figsize=(8, 6))
     plt.plot(fpr, tpr, color='blue', label=f'ROC curve (AUC = {auc_score:.2f})')
@@ -183,10 +192,14 @@ def train_and_evaluate(data, test_days=30, target_region='Unknown'):
     plt.tight_layout()
     plt.show()
 
-    # Feature Importance (Top 15)
-    importances = pd.Series(model.feature_importances_, index=features).sort_values(ascending=False)
+    # Feature Importance Plot (Averaged across the 3 calibrated cross-validation models)
+    avg_importances = np.mean([
+        clf.estimator.feature_importances_ for clf in calibrated_model.calibrated_classifiers_
+    ], axis=0)
+
+    importances_series = pd.Series(avg_importances, index=features).sort_values(ascending=False)
     plt.figure(figsize=(10, 5))
-    importances.head(15).plot(kind='bar', color='steelblue')
+    importances_series.head(15).plot(kind='bar', color='steelblue')
     plt.title(f'Top 15 Decision Features for {target_region}')
     plt.ylabel('Relative Importance')
     plt.xticks(rotation=45, ha='right')
@@ -196,7 +209,7 @@ def train_and_evaluate(data, test_days=30, target_region='Unknown'):
 
 # --- Execution ---
 LOCAL_FILE = 'volunteer_data_en.csv'
-TARGET_REGION = 'Dnipropetrovska oblast'
+TARGET_REGION = 'Kyivska oblast'
 
 try:
     AUTOMATED_NEIGHBORS = UKRAINE_ADJACENCY[TARGET_REGION]
